@@ -1,0 +1,245 @@
+#!/bin/bash
+set -e
+PREFIX=/usr/local/sbin
+CONF=/etc/wwban.conf
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+ROOT=$(cd "$(dirname "$SELF")" && pwd)
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "با root اجرا کنید: sudo $0 $*"
+    exit 1
+  fi
+}
+
+load_conf() {
+  [ -f "$CONF" ] && . "$CONF"
+  PORTS=${PORTS:-443,8443,2083,2053,2087,2096,7777}
+  LIMIT_CONN=${LIMIT_CONN:-300}
+  LIMIT_SYN=${LIMIT_SYN:-80}
+  BAN_SEC=${BAN_SEC:-10800}
+}
+
+pause() {
+  echo
+  read -r -p "Enter بزنید برای برگشت به منو... " _
+}
+
+list_bans() {
+  load_conf
+  echo
+  echo "IPهای بلاک‌شده (timeout حدود $((BAN_SEC/3600)) ساعت):"
+  echo "----------------------------------------------"
+  if ! ipset list wwban >/dev/null 2>&1; then
+    echo "لیست خالی است یا wwban نصب نشده."
+    return
+  fi
+  mapfile -t LINES < <(ipset list wwban | awk '/^[0-9]+\./{print}')
+  if [ "${#LINES[@]}" -eq 0 ]; then
+    echo "(هیچ IP بلاک نیست)"
+    return
+  fi
+  i=1
+  for line in "${LINES[@]}"; do
+    printf "  %2d) %s\n" "$i" "$line"
+    i=$((i + 1))
+  done
+}
+
+unban_menu() {
+  load_conf
+  if ! ipset list wwban >/dev/null 2>&1; then
+    echo "نصب نشده یا لیست خالی است."
+    return
+  fi
+  mapfile -t IPS < <(ipset list wwban | awk '/^[0-9]+\./{print $1}')
+  echo
+  if [ "${#IPS[@]}" -eq 0 ]; then
+    echo "هیچ IP بلاک نیست."
+    return
+  fi
+  i=1
+  for ip in "${IPS[@]}"; do
+    printf "  %2d) %s\n" "$i" "$ip"
+    i=$((i + 1))
+  done
+  echo "   a) آنبن همه"
+  echo "   m) وارد کردن IP دستی"
+  echo
+  read -r -p "شماره یا IP: " sel
+  case "$sel" in
+    a|A)
+      ipset flush wwban
+      echo "همه آنبن شدند."
+      ;;
+    m|M)
+      read -r -p "IP: " ip
+      ipset del wwban "$ip" && echo "آنبن شد: $ip" || echo "این IP در لیست نبود."
+      ;;
+    '')
+      return
+      ;;
+    *)
+      if [[ "$sel" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ipset del wwban "$sel" && echo "آنبن شد: $sel" || echo "این IP در لیست نبود."
+      elif [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#IPS[@]}" ]; then
+        ip="${IPS[$((sel-1))]}"
+        ipset del wwban "$ip" && echo "آنبن شد: $ip"
+      else
+        echo "نامعتبر."
+      fi
+      ;;
+  esac
+}
+
+change_ports() {
+  load_conf
+  echo
+  echo "پورت‌های فعلی: $PORTS"
+  echo "با ویرگول جدا کنید. پورت SSH (22) را نگذارید."
+  read -r -p "پورت‌های جدید: " np
+  np=$(echo "$np" | tr -d ' ')
+  if [ -z "$np" ]; then
+    echo "لغو شد."
+    return
+  fi
+  if ! echo "$np" | grep -Eq '^[0-9]+(,[0-9]+)*$'; then
+    echo "فرمت نامعتبر."
+    return
+  fi
+  if echo ",$np," | grep -q ',22,'; then
+    echo "پورت 22 را اضافه نکنید تا SSH بسته نشود."
+    return
+  fi
+  sed -i "s/^PORTS=.*/PORTS=$np/" "$CONF"
+  /usr/local/sbin/wwban-setup.sh
+  echo "پورت‌ها ذخیره شد: $np"
+}
+
+do_install() {
+  command -v apt-get >/dev/null && apt-get install -y ipset iptables >/dev/null
+  command -v ipset >/dev/null || { echo "ipset نصب نشد"; exit 1; }
+  mkdir -p /usr/local/sbin
+  install -m 755 "$ROOT/wwban" /usr/local/sbin/wwban
+  install -m 755 "$ROOT/wwban-setup.sh" /usr/local/sbin/wwban-setup.sh
+  install -m 755 "$ROOT/conn-watch.sh" /usr/local/sbin/conn-watch.sh
+  if [ ! -f "$CONF" ]; then
+    install -m 644 "$ROOT/wwban.conf" "$CONF"
+  fi
+  cat >/etc/systemd/system/wwban.service <<'EOF'
+[Unit]
+Description=Waterwall IP ban (ipset)
+After=network.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wwban-setup.sh
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >/etc/logrotate.d/conn-watch <<'EOF'
+/var/log/conn-watch.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+  touch /var/log/conn-watch.log
+  systemctl daemon-reload
+  systemctl enable wwban.service >/dev/null
+  /usr/local/sbin/wwban-setup.sh
+  systemctl start wwban.service
+  (crontab -l 2>/dev/null | grep -v conn-watch.sh; echo '* * * * * /usr/local/sbin/conn-watch.sh') | crontab -
+  echo "نصب شد. منو: sudo wwban"
+}
+
+do_uninstall() {
+  crontab -l 2>/dev/null | grep -v conn-watch.sh | crontab - || true
+  systemctl disable --now wwban.service 2>/dev/null || true
+  rm -f /etc/systemd/system/wwban.service
+  systemctl daemon-reload 2>/dev/null || true
+  load_conf
+  iptables-save | grep -E -- '--match-set wwban' | sed 's/^-A INPUT //' | while read -r spec; do
+    iptables -D INPUT $spec 2>/dev/null || true
+  done
+  ipset destroy wwban 2>/dev/null || true
+  ipset destroy wwallow 2>/dev/null || true
+  rm -f /usr/local/sbin/wwban-setup.sh /usr/local/sbin/conn-watch.sh /usr/local/sbin/wwban
+  rm -f /etc/logrotate.d/conn-watch
+  echo "حذف شد. کانفیگ $CONF و لاگ باقی ماندند."
+  read -r -p "کانفیگ و لاگ هم پاک شود؟ [y/N] " y
+  if [ "$y" = y ] || [ "$y" = Y ]; then
+    rm -f "$CONF" /var/log/conn-watch.log
+    echo "پاک شد."
+  fi
+}
+
+status() {
+  load_conf
+  echo "پورت‌ها: $PORTS"
+  echo "حد اتصال همزمان: $LIMIT_CONN"
+  echo "حد SYN نیمه‌کاره: $LIMIT_SYN"
+  echo "مدت بن: $BAN_SEC ثانیه"
+  echo
+  list_bans
+}
+
+menu() {
+  while true; do
+    load_conf
+    echo
+    echo "========== wwban =========="
+    echo "  1) لیست IPهای بلاک‌شده"
+    echo "  2) آنبن کردن"
+    echo "  3) تغییر پورت‌ها"
+    echo "  4) وضعیت"
+    echo "  5) نصب / به‌روزرسانی"
+    echo "  6) آنیستال"
+    echo "  0) خروج"
+    echo "==========================="
+    read -r -p "گزینه: " c
+    case "$c" in
+      1) list_bans; pause ;;
+      2) unban_menu; pause ;;
+      3) change_ports; pause ;;
+      4) status; pause ;;
+      5) do_install; pause ;;
+      6) do_uninstall; pause ;;
+      0) exit 0 ;;
+      *) echo "نامعتبر" ;;
+    esac
+  done
+}
+
+need_root "$@"
+cmd=${1:-menu}
+case "$cmd" in
+  menu) menu ;;
+  install) do_install ;;
+  uninstall) do_uninstall ;;
+  list) list_bans ;;
+  unban)
+    if [ -n "${2:-}" ]; then
+      ipset del wwban "$2" && echo "آنبن شد: $2" || echo "نبود: $2"
+    else
+      unban_menu
+    fi
+    ;;
+  ports)
+    if [ -n "${2:-}" ]; then
+      sed -i "s/^PORTS=.*/PORTS=$2/" "$CONF"
+      /usr/local/sbin/wwban-setup.sh
+      echo "پورت‌ها: $2"
+    else
+      change_ports
+    fi
+    ;;
+  status) status ;;
+  *)
+    echo "usage: wwban [menu|install|uninstall|list|unban IP|ports a,b,c|status]"
+    exit 1
+    ;;
+esac
