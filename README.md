@@ -7,9 +7,7 @@
 ## نصب
 
 ```bash
-sudo bash install.sh
-# یا
-sudo ./wwban install
+curl -fsSL https://raw.githubusercontent.com/khodehamed/wwban/main/install.sh | sudo bash
 ```
 
 منو:
